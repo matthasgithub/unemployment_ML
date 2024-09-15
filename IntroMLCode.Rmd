@@ -1,0 +1,664 @@
+---
+title: "Forecasting Unemployment Rates in the U.S."
+author: "Matt K"
+date: "2024-08-20"
+output: 
+  html_document:
+    theme: yeti
+    fig_align: center
+    df_print: paged
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+# Introduction
+The goal of this project is to develop a model that can estimate unemployment rates in the U.S. using mortgage information for each state.
+
+### Background
+The data in this project comes from a variety of sources, including the Bureau of Labor Services^[https://download.bls.gov/pub/time.series/la/], Zillow forecasting^[https://www.zillow.com/research/data/], and the Federal Housing Finance Agency^[https://www.fhfa.gov/data/national-mortgage-database-aggregate-statistics] mortgage datasets. The data is divided by state, chronologically from January 2000 to December 2022, containing data from monthly unemployment reports and mortgage info. Notably, this period includes the 2007-2008 financial crisis, caused in large part by a failure in the housing market to adequately protect itself, resulting in the creation and subsequent collapse of the housing bubble. A subprime mortgage is a loan written to a borrower with poor credit history - essentially, a borrower with a higher risk of defaulting on the loan than a prime borrower, someone who is deemed likely to repay their loan. 
+
+In the years leading up to the crisis, subprime mortgages were approved as bankers assumed the housing market would continue to rise, so if someone defaulted on their loan, all the bank had to do was sell the house to recoup their losses. As such, from the bankers perspective, it was a win-win situation: either the subprime borrower repays the loan, or the house covers the cost. To aggravate the issue, mortgage-backed securities, a form of investment, were sold as prime AAA-assets, considered among the safest of all investments, yet backed by subprime mortgages. Once the bubble burst, default rates rapidly increased, and the global economy suffered. As such, it will be interesting to see if the conditions that prompted the 2007-08 financial crisis will help the model - and to see if the model performs better when only considering data following the regulatory changes that occurred in response to the financial crisis.
+
+### Expectations
+The COVID-19 pandemic in early 2020 led to an economic decline in the U.S., and globally, of catastrophic proportion, as some employees were laid-off in response to quarantine-guidelines to find jobs soon after, while many others were thrown into long-term unemployment. I imagine the model will do a poor job at predicting this historic period of unemployment, the greatest in the U.S. since the Great Depression, though it will hopefully predict some of the unemployment.
+
+### Approach
+The project explores various machine-learning regression techniques, and evaluates the best model by its performance on the training set - then, the top 2 performing models are fit and evaluated on the testing set.
+
+# EDA
+First we load in and tidy the data, then perform some preliminary analysis.
+```{r, results = 'hide', message = FALSE}
+# Load all packages
+library("readxl")
+library("data.table")
+library(naniar)
+library(rsample)
+library(patchwork)
+library(janitor)
+library(tidyverse)
+library(tidymodels)
+library(zoo)
+library(ggplot2)
+library(corrplot)
+library(glmnet)
+library(kknn)
+library(rpart.plot)
+library(ranger)
+library(vip)
+library(xgboost)
+tidymodels_prefer()
+```
+
+### Loading and Tidying Data
+```{r read_data}
+# Read-in and assign datasets to a variable
+housing_data <- read.csv("data/State Home Value - Zestimate.csv")
+unemployment_data <- read.table("data/State Unemployment.txt", sep="\t", header = T)
+mortgage_data <- read.csv("data/Mortgage data.csv")
+# Remove comments to preview data-frames
+# head(housing_data) 
+# Needs to be reformatted to long-form - 300 columns, shows median home value by state, monthly for the past 30 or so years
+# head(unemployment_data) 
+# Needs reformatting, but series_id relates to a state, and value corresponds to 6 different measures of employment and will need to be tidied - unemployment rate (%), number of employed, etc.
+# head(mortgage_data)
+# Needs to be reformatted to wide format by series_id, and only focus on "All Mortgages (Home Purchase)" market
+```
+
+After reading in our 3 data sets, lets see where the missing data is. We can see below that housing_data is fairly complete, missing only a small portion of data, so it is easiest to simply remove those missing values.
+```{r tidying}
+# Select relevant variables and transform housing_data to long-form by State
+housing_data <- subset(housing_data, select = -c(RegionID, SizeRank, RegionType, StateName))
+housing_data <- melt(setDT(housing_data), id.vars = "RegionName", variable.name = "date") 
+
+# Extract year and month from date
+housing_data <- housing_data %>%
+  mutate(year = as.integer(str_sub(date, 2, 5)),
+         month = as.integer(str_sub(date, 7, 8))) 
+
+vis_miss(housing_data) # Since missing data is fairly limited, easiest to omit missing values
+housing_data <- housing_data %>%
+  select(state = RegionName, year, month, median_home_value = value) %>%
+  na.omit()
+
+# Read-in variable-code dictionary from BLS database to convert from code-named variable to named variables
+statistic_map <- read.table("data/la.measure", sep = "\t", header = T) 
+
+# Read-in state-code dictionary from BLS database to convert from code-named states to named states
+state_map <- read.table("data/la.state_region_division", sep = "\t", header = T) 
+
+# Extract relevant details to prepare for mapping
+unemployment_data <- unemployment_data %>%
+  mutate(statistic_code = as.integer(str_sub(series_id, 20)),
+         state_code = as.integer(str_sub(series_id, 6, 7)), # Extract identifying codes from series_id
+         month = as.integer(str_sub(period, 2, 3))) # Extract month from period variable
+
+# Map variables and states to convert from code-names for readability
+unemployment_data <- merge(unemployment_data, statistic_map, by.x = "statistic_code", by.y = "measure_code")
+unemployment_data <- merge(unemployment_data, state_map, by.x = "state_code", by.y = "srd_code")
+
+# Select relevant variables and convert data to wide-format for ease of use
+unemployment_data <- unemployment_data %>%
+  select(state = srd_text, measure = measure_text, year, month, value)
+unemployment_data <- dcast(setDT(unemployment_data), state + year + month ~ measure, value.var = "value")
+unemployment_data <- unemployment_data %>%
+  mutate(across(-state, as.numeric))
+
+# Select relevant variables and rows, i.e. "All Mortgages"
+mortgage_data <- mortgage_data %>%
+  filter(MARKET == "All Mortgages") %>%
+  select(state = GEONAME, year = YEAR, SERIESID, VALUE1, VALUE2)
+
+# Melt mortgage data and extract relevant variables in long-form
+mortgage_data <- melt(setDT(mortgage_data), id.vars = c("state", "year", "SERIESID"), value.name = "value")
+mortgage_data <- dcast(setDT(mortgage_data), state + year ~ SERIESID + variable, value.var = "value")
+
+# Merge dataset on state, year, and month
+unemp_housing <- merge(unemployment_data, housing_data, by = c("state", "year", "month"))
+merged_data <- merge(unemp_housing, mortgage_data, by = c("state", "year"))
+merged_data <- cbind(date = as.Date(paste(merged_data$year, merged_data$month, "01", sep = "-"), format = "%Y-%m-%d"), merged_data) # Convert date to usable format at the start of each month for consistency, i.e YYYY-MM-DD
+
+# Order merged data by date
+merged_data <- merged_data[order(as.Date(merged_data$date, format = "%Y-%m-%d"))]
+merged_data <- clean_names(merged_data)
+merged_data <- merged_data %>%
+  select(-c(year, month, unemployment, employment, employment_population_ratio))
+```
+
+### Exploring the Data
+```{r}
+dim(merged_data)
+```
+The dataset has 13848 rows and 122 columns - this might need to be narrowed down later.
+
+```{r missing_val}
+missing_data <- sapply(merged_data, function(x) sum(is.na(x)))
+print(paste("There are", sum(missing_data), "missing observations!"))
+high_na <- names(which(missing_data > 2000)) # Columns with high portions of missing data
+# high_na # Running this line of code reveals the columns with missing data to be of little interest
+# The variables with high amounts of missing data are also not variables of interest, and can be removed with minimal loss of info
+```
+Woah! That is a lot of missing data, but it is clustered in columns which appear to be of little interest so they can be removed. Let's make sure we removed all the missing data below, then view the dimensions and preview the cleaned data.
+
+```{r}
+merged_data <- merged_data %>%
+  select(-all_of(high_na), -ends_with("value2")) # Many columns have a value2 which does not convey much info and creates multicollinearity - these are removed
+sum(is.na(merged_data))
+dim(merged_data)
+head(merged_data)
+```
+Upon removing the missing values and removing variables with excessive repetition and multicorrelation, since many variables had a value1 and value2 column reporting nearly identical information, there are still 13848 rows, but only 52 columns.
+
+### Splitting the Data
+In order to prevent data leakage, a time split is performed with a 70:30 split between the training and testing set. Let's make sure the split is performed correctly.
+```{r initial_split}
+set.seed(158342) # Set seed for reproducibility
+# Split the data with a time_split to prevent leakage
+time_split <- initial_time_split(merged_data, prop = .70)
+# Save the training and testing splits
+split_train <- training(time_split) 
+split_test <- testing(time_split)
+# Save a k-fold cross-validation for later with 5 folds, opting for no stratification due to time-series data - a sliding-window was considered, but voided for simplicity and poor performance
+split_fold <- vfold_cv(split_train, v = 5)
+# Verify that the data split correctly
+nrow(split_train)/nrow(merged_data)
+nrow(split_test)/nrow(merged_data)
+```
+There is a proportion of ~70% in the training set and ~30% in the testing set, so the split operated correctly. Additionally, a k-fold cross-validation set is created using 5 folds from the training set. We perform cross-validation with 5 folds instead of 10 to save resources, and do this in order to yield better models from when tuning in order to iterate our model over more data.
+
+```{r}
+print(paste("There are ", sum(is.na(split_train)), " missing values left, and the training set ranges from the years ", format(min(split_train$date), "%Y"), " to ", format(max(split_train$date), "%Y"), ". There are ", nrow(split_train), " rows and ", ncol(split_train), " columns in the training set.", sep = ""))
+```
+### Exploring the Training Set
+
+```{r split_graph}
+ggplot(merged_data, aes(x = date, y = unemployment_rate)) +
+  geom_line() +
+  geom_vline(xintercept = as.numeric(max(split_train$date)), color = "red", linetype = "dashed") +
+  ggtitle("Time Series Data with Training and Testing Split") +
+  theme_minimal() # Plot the time-series split
+```
+<br>
+This graph shows the unemployment rate averages from 2000-2022, with the dashed red-line representing the split between the training and testing sets. Clearly, 2020 represents a distinct outlier, as COVID-19 notably impacted the economy in unpredictable ways. Thus, it is important to treat the initial increase in unemployment due to COVID-19 not as a fault in the model for predicting normal business cycles, but as a warning that the model is poor at predicting news shocks - that would be interesting to explore in another model that incorporates a variable for "news". There is also a notable and lengthy period of unemployment following the 2007-2008 financial crisis.
+
+```{r}
+hist(split_train$unemployment_rate, breaks = 25) 
+```
+
+The histogram shows that unemployment across from 2000-2016 is right-skewed, tending towards ~5%, with some states experiencing short periods of high unemployment. This matches the time-series graph above, which shows a sudden increase in unemployment lasting for several years, but steadily decreasing from the peak. These sudden movements suggest that unemployment rate may be highly sensitive to news shocks, something that may not be reflected well in mortgage rates, which tend to have long-time horizons. However, this will be something to look for when modelling, as new mortgage loans are highly sensitive to economic conditions due to interest rate changes and potentially refinancing or defaulting on loans when employment and income is hard to find.
+
+### Summaries and Correlation
+Below, we can see summary statistics of the unemployment rate, with a mean greater than the median of 5.50%. The minimum unemployment rate is 2%. The highest unemployment rate is also highlighted, found in 2009 during the Great Recession.
+
+```{r summaries}
+summary(split_train$unemployment_rate)
+split_train[which.max(split_train$unemployment_rate)]
+```
+
+The unemployment rate in the training set reached a maximum in 2009, in the state of Michigan, at 14%. This spike is seen throughout the training set, due largely to the Great Recession.
+
+```{r corr_plot}
+# Select numeric columns by name, calculate the correlation of each with respect to unemployment_rate
+numeric <- sapply(split_train, is.numeric) 
+numeric <- names(split_train)[numeric]
+corr_mat <- sapply(numeric, function(x) cor(split_train[[x]], split_train$unemployment_rate))
+corr_mat <- data.frame(Var = numeric, Correlation = corr_mat) # Convert to a data-frame for plotting
+# Plot ordered correlations in increasing order
+ggplot(corr_mat, aes(x = reorder(Var, Correlation), y = Correlation)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Correlation of All Variables with Unemployment Rate",
+       x = "Variables") +
+  theme_minimal() + 
+  theme(axis.text.x = element_blank()) # Remove variable names from x-axis for readability
+```
+
+There appears to be a fair number of moderately correlated variables with the outcome variable, as shown by the moderate number of predictors around -0.5 and 0.5 correlation. There also appear to be a fair number of uncorrelated variables, which could be dealt with via feature selection.
+
+```{r, message = FALSE}
+# Graph unemployment_rate against variable of choice (here, ave_intrate_value1), reveals potential non-linear relationships
+ggplot(split_train, aes(x = unemployment_rate, y = ave_intrate_value1, y ~ x)) + 
+  geom_point() +
+  geom_smooth(formula = y ~ x, method = "loess")
+```
+
+It appears as if some variables have a non-linear relationship with unemployment rate, as seen above, where average interest rate is shown on the y axis and a curved line-of-best fit shows a parabolic shape. The data will be used as is, though this is something to keep in mind if there is poor performance in the models.
+
+# Recipe Creation
+Here, two recipes are created - one, unemp_recipe, by removing the factors and then normalizing all predictors, while the other, PCA_recipe, includes a principal component analysis keeping 10 components. Two recipes are created to examine interpretability as well as complexity.
+```{r recipes, results = "hide"}
+unemp_recipe <- recipe(unemployment_rate ~ ., data = split_train) %>%
+  step_rm(date, state) %>%
+  step_normalize(all_predictors())
+
+prep(unemp_recipe) %>% 
+  bake(new_data = split_train)
+
+PCA_recipe <- recipe(unemployment_rate ~ ., data = split_train) %>%
+  step_rm(date, state) %>%
+  step_normalize(all_predictors()) %>%
+  step_pca(all_predictors(), num_comp = 10)
+
+prep(PCA_recipe) %>%
+  bake(new_data = split_train)
+```
+
+# Models
+Each of the models followed a similar build, with slight differences in the implementation of each - the recipe for each was decided by performance and computation costs, so PCA_recipe was used for more computationally intensive models. Each model was tuned where possible, then fit with a grid of varying levels (dependent again upon computation costs). Finally, each model was fit and evaluated on the training set on their RMSE, though in order to avoid over-fitting, the exact implementation of this varies, and is detailed in each respective model's description. The results of the models are compared after all the models are set-up.
+### Elastic Net Model
+Tuning the mixture and penalty hyperparemeters with 10 levels, the results are shown below. The ranges for tuning mixture are 0-1 and also 0-1 for penalty.
+```{r enn_workflow}
+# Set up the model and the workflow, with the unemp_recipe since this model does not require much computing power
+elastic_net_model <- linear_reg(mixture = tune(), 
+                                penalty = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+elastic_net_workflow <- workflow() %>%
+  add_recipe(unemp_recipe) %>%
+  add_model(elastic_net_model)
+```
+
+```{r enn_tuning} 
+# Create a tuning grid for the elastic_net model, with penalty and mixture values to try and 10 levels
+elastic_net_grid <- grid_regular(penalty(range = c(0, 1),
+                                         trans = identity_trans()),
+                                 mixture(range = c(0, 1)),
+                                 levels = 10)
+```
+
+```{r}
+# The tuning results are computed and plotted
+tune_results <- tune_grid(
+  elastic_net_workflow,
+  resamples = split_fold,
+  grid = elastic_net_grid
+  )
+autoplot(tune_results)
+```
+
+The tuning results of the elastic net model show low regularization performs best - the R-squared values show that the model did not perform as well as it could have, though the RMSE is fairly low for all models. This could be a good sign that the model did not overfit to the training set, something that may be prone to happen due to the specificity of this data as well as the vast number of features.
+
+```{r}
+# Opt to use one_std_error selection here due to close proximity of each models, select least complex
+best_en_model <- select_by_one_std_err(tune_results,
+                          metric = "rmse",
+                          penalty,
+                          mixture)
+# Finalize optimal workflow with tuning results
+elastic_net_final <- finalize_workflow(elastic_net_workflow,
+                                       best_en_model)
+# Fit the workflow to the training data
+elastic_fit <- fit(elastic_net_final,
+                   data = split_train)
+# Predict values with the training data
+elastic_pred <- predict(elastic_fit, new_data = split_train  %>%
+                               select(-unemployment_rate))
+# Bind true unemployment_rate as well as date, state for plotting purposes
+elastic_pred <- bind_cols(elastic_pred, split_train %>% select(unemployment_rate, state, date))
+```
+
+### k-Nearest Neighbors model
+A k-Nearest Neighbors model is fit to the training set, tuning for the number of k-nearest neighbors between 1-250, with 10 levels. The PCA_recipe is used with the hopes of reducing overfitting by using 10 components instead of all 93 predictors. The results are plotted below.
+
+```{r KNN} 
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("regression")
+
+knn_workflow <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(PCA_recipe) # Use PCA_recipe instead of unemp_recipe to avoid overfitting
+# Set-up tuning grid with 10 levels, from 1-250 neighbors
+knn_grid <- grid_regular(
+  neighbors(range = c(1, 250)),
+            levels = 10)
+```
+
+```{r KNN_tune}
+tune_results_knn <- tune_grid(
+  knn_workflow,
+  resamples = split_fold,
+  grid = knn_grid
+)
+autoplot(tune_results_knn)
+```
+
+The tuning results for the KNN model show that as the number of neighbors increases, R-squared decreases and RMSE increases slowly. However, with a low number of nearest neighbors, the R-squared is extremely high. As such, it is highly likely that overfitting is occuring at this point, and since there is fairly minimal losses with more neighbors, the best model is selected with a 15% allowable loss in the R-squared to avoid over-fitting to the training set.
+
+```{r KNN_fit}
+# Allow 15% loss to R-squared in order to prevent over-fitting to training set
+best_knn_model <- select_by_pct_loss(tune_results_knn,
+                                     metric = "rsq",
+                                     limit = 15,
+                                     desc(neighbors)
+                                     )
+# Finalize workflow with optimal tuned model
+knn_final <- finalize_workflow(knn_workflow, best_knn_model)
+# Fit model and predict unemployment_rate
+knn_fit <- fit(knn_final, split_train)
+knn_pred <- predict(knn_fit, split_train)
+# Bind true unemployment_rate as well as date, state for plotting purposes
+knn_pred <- bind_cols(knn_pred, split_train %>%
+                        select(date, state, unemployment_rate))
+```
+
+### Linear Model
+A simple linear model is fit using k-fold cross-validation on the PCA_recipe to avoid multi-collinearity in predictors. This model is not tuned, but the results are stored for evaluation later.
+```{r}
+# Set up the model, workflow with PCA_recipe, then fit and predict values
+lm_model <- linear_reg() %>%
+  set_engine("lm")
+lm_workflow <- workflow() %>%
+  add_model(lm_model) %>%
+  add_recipe(PCA_recipe) 
+# Fit model and predict unemployment_rate
+lm_fit <- fit(lm_workflow, split_train)
+lm_pred <- predict(lm_fit, new_data = split_train)
+# Bind true unemployment_rate as well as date, state for plotting purposes
+lm_pred <- bind_cols(lm_pred, split_train %>%
+                             select(state, date, unemployment_rate))
+```
+
+### Pruned Decision Tree
+A decision tree is tuned for cost_complexity with the PCA_recipe for performance improvements, with 10 levels. The performance of each model is graphed below. The ranges for tuning cost_complexity are 0.001 to 0.1 with 10 levels. The results are plotted below.
+```{r decision_tree}
+# Process is nearly identical to previous models
+tree_model <- decision_tree(cost_complexity = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+
+tree_workflow <- workflow() %>%
+  add_model(tree_model) %>%
+  add_recipe(PCA_recipe)
+
+tree_grid <- grid_regular(
+  cost_complexity(range = c(-3, -1)), # Tune cost_complexity on a log-scale, so -3 ->10^-3 and -1 -> 10^-1
+  levels = 10
+) 
+```
+
+```{r tree_tune}
+# Collect results from tune and plot
+tune_results_tree <- tune_grid(
+  tree_workflow,
+  resamples = split_fold,
+  grid = tree_grid)
+
+autoplot(tune_results_tree)
+```
+
+The performance of the model is best at low cost-complexity, with a fairly linear and significant drop in performance. The best model is selected using a 10% acceptable loss in the R-square metric to avoid overfitting.
+
+```{r}
+# Avoid overfitting with 10% acceptable loss in R^squared metric
+tree_best <- select_by_pct_loss(tune_results_tree,
+                                metric = "rsq",
+                                limit = 10,
+                                desc(cost_complexity)
+                                )
+# Finalize workflow with optimal model
+tree_final <- finalize_workflow(tree_workflow, tree_best)
+# Fit and predict values on training set
+tree_fit <- fit(tree_final, data = split_train)
+tree_pred <- predict(tree_fit, new_data = split_train %>% 
+                       select(-unemployment_rate))
+# Bind true unemployment_rate as well as date, state for plotting purposes
+tree_pred <- bind_cols(tree_pred, split_train %>%
+                         select(date, state, unemployment_rate))
+```
+
+```{r}
+# View the decision tree
+tree_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot(roundint = F)
+```
+
+Due to the use of PCA and a low cost-complexity, the pruned decision tree is difficult to interpret. Regardless, it can be seen that a value of 2.4 is the cut-off for PC_01, and the tree can be followed as deeply as desired.
+
+### Random Forest Model
+A random forest model is tuned on mtry, trees, and min_n with the PCA_recipe due to computational costs. The range of mtry is 1-9 due to complexity and PCA bounded at 10 variables, while trees goes from 101-501 for complexity costs and min_n ranges from 5-15, and there are 4 levels, again for computational reasons. Furthermore, the model is saved as forest_res.rda and loaded in to avoid having to re-run the model due to long run-times.
+
+```{r random_forest}
+set.seed(135) # Set seed for reproducibility due to random nature of random forests
+forest_model <- rand_forest(mtry = tune(),
+                            trees = tune(),
+                            min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+forest_workflow <- workflow() %>%
+  add_model(forest_model) %>%
+  add_recipe(PCA_recipe) # Selected over unemp_recipe to minimize run-time
+forest_grid <- grid_regular(mtry(range = c(1, 9)), # 1-9 selected due to limited PCA variables
+                            trees(range = c(101, 501)), # Selected to limit complexity
+                            min_n(range = c(5, 15)),
+                            levels = 4)
+```
+
+```{r, eval = FALSE}
+# eval = FALSE to avoid re-running costly model, instead save file and load back in later
+forest_tune_res <- tune_grid(
+  forest_workflow,
+  grid = forest_grid,
+  resamples = split_fold
+)
+save(forest_tune_res, file = "forest_res.rda") # save file
+```
+
+```{r}
+load("forest_res.rda") # load file
+autoplot(forest_tune_res)
+```
+
+The tuning results of the random forest show the best performance with min_n = 5, as seen by the lowest RMSE values and highest R-squared values. Within these, it appears as if more trees perform better along with more randomly selected predictors. Since the PCA components already cut a lot of the variables in the dataset to the 10 most important comopnents, it makes sense that using more variables is a more accurate model. That being said, to avoid an overly complex model, one_std_err selection is performed on RMSE. The variable importance plot below shows that PC01 is by far the most important, which makes sense with how PCA operates, and then there is a significant drop in the importance of the next components. 
+
+```{r}
+# Select by one_std_err on RMSE to avoid overly complex model
+best_forest <- select_by_one_std_err(forest_tune_res, metric = 'rmse', trees)
+
+forest_final <- finalize_workflow(forest_workflow, best_forest)
+forest_fit <- fit(forest_final, data = split_train)
+# Variable Importance Plot to show most/least important components
+forest_fit %>% extract_fit_parsnip() %>%
+  vip() + theme_minimal()
+```
+
+```{r}
+# Predict unemployment rates from training set
+forest_pred <- predict(forest_fit, split_train %>%
+                         select(-unemployment_rate))
+# Bind true unemployment_rate as well as date, state for plotting purposes
+forest_pred <- bind_cols(forest_pred, split_train %>%
+                           select(date, state, unemployment_rate))
+```
+
+### Boosted Tree Model
+A boosted tree model, set up similar to the random forest with one key difference - instead of tuning for min_n, we tune for learn_rate, deemed more significant in the performance of boosted tree models. For similar reasons as the random forest, the results of tuning are saved in a separate file and loaded in. The ranges for tuning are mtry from 1-11, trees from 501-1301, and learn_rate from 0.00000001-0.1 with 6 levels. The results of tuning are graphed below. 
+
+```{r boosted_tree}
+set.seed(513) # Set seed for reproducibility
+boosted_model <- boost_tree(mtry = tune(),
+                            trees = tune(),
+                            learn_rate = tune()) %>%
+  set_engine("xgboost") %>% # importance = "impurity", removed for knitting
+  set_mode("regression")
+boosted_workflow <- workflow() %>%
+  add_model(boosted_model) %>%
+  add_recipe(PCA_recipe)
+boosted_grid <- grid_regular(mtry(range = c(1, 11)),
+                             trees(range = c(501, 1301)), # Tune from 501-1301
+                             learn_rate(range = c(.00000001, .1), # Tune from very low learn_rate to .1
+                                        trans = identity_trans()),
+                             levels = 6)
+```
+
+```{r, eval = FALSE}
+boosted_tune_res <- tune_grid(
+  boosted_workflow,
+  grid = boosted_grid,
+  resamples = split_fold
+)
+save(boosted_tune_res, file = "boosted_res.rda")
+```
+
+```{r}
+load("boosted_res.rda")
+autoplot(boosted_tune_res) + theme_minimal()
+```
+
+The tuning results show that the lowest learning rate performs much worse, but then there is little improvement among the other models. Furthermore, the number of trees appears negligible, and the model performance increases marginally with the number of randomly selected predictors. As such, one_std_err selection is used on RMSE to limit complexity, even though it appears overfitting will still occur.
+
+```{r}
+# Select by one_std_err by RMSE on learn_rate to limit complexity of model
+best_boosted <- select_by_one_std_err(boosted_tune_res,
+                            metric = "rmse",
+                            learn_rate)
+# Finalize workflow with optimal tuning info
+boosted_final <- finalize_workflow(boosted_workflow, best_boosted)
+# Fit model to training set and predict unemployment rates
+boosted_fit <- fit(boosted_final, data = split_train)
+boosted_pred <- predict(boosted_fit, new_data = split_train %>%
+                          select(-unemployment_rate))
+# Bind true unemployment_rate as well as date, state for plotting purposes
+boosted_pred <- bind_cols(boosted_pred, split_train %>%
+                            select(date, state, unemployment_rate))
+```
+
+```{r}
+boosted_fit %>%
+  extract_fit_parsnip() %>%
+  vip() # Variable importance plot
+```
+
+The variable importance plot shows similar results to the VIP of the random forest, with PC_01 ranked the most important component in the model, as expected due to how PCA operates - collecting the most information in the first component, and so on.
+
+```{r}
+# Plot predicted values versus true values
+boosted_pred %>%
+  ggplot(aes(x = unemployment_rate, y = .pred)) + 
+  geom_point(alpha = .3) +
+  #scale_y_continuous(limits = c(2, 8)) +
+  #scale_x_continuous(limits = c(2, 15)) +  
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  theme_minimal()
+```
+
+This graph shows predicted unemployment rates against the observed unemployment rates, with the red line showing a perfect predictor. Clearly, the model predicts unemployment rate well on the training set, but this might be a sign of overfitting due to how little variance there is.
+
+# Evaluating Model Performance
+The chunk below creates a function with 2 inputs, state_plot(model_name, state_name), for plotting a model's predicted unemployment rate versus the actual unemployment rate across time, by state.
+```{r}
+# Function to plot a model's predicted unemployment_rate vs the actual value, by state 
+state_plot <- function(model_name, state_name, title_plot) {
+  state_data <- model_name %>%
+    filter(state == state_name)
+  ggplot(state_data, aes(x = date)) +
+    geom_line(aes(y = unemployment_rate), color = "black") + 
+    geom_line(aes(y = .pred), color = "red") +
+    labs(title = title_plot) + 
+    theme_minimal()
+}
+```
+
+```{r comparison}
+metrics <- metric_set(rsq, rmse, mae) # Metrics for the regression models
+
+# Examine the performance of the final elastic net model
+en_rmse <- metrics(elastic_pred, truth = unemployment_rate, estimate = .pred)$.estimate[2]
+en_plot <- state_plot(elastic_pred, "Alabama", "Elastic Net")
+
+# Examine the performance of the final KNN model
+knn_rmse <- metrics(knn_pred, truth = unemployment_rate, estimate = .pred)$.estimate[2]
+knn_plot <- state_plot(knn_pred, "California", "k-NN")
+
+# Examine the performance of the linear regression
+lm_rmse <- metrics(lm_pred, truth = unemployment_rate, estimate = .pred)$.estimate[2]
+lm_plot <- state_plot(lm_pred, "California", "Linear Regression")
+
+
+# Examine the performance of the pruned decision tree model
+dt_rmse <- metrics(tree_pred, truth = unemployment_rate, estimate = .pred)$.estimate[2]
+dt_plot <- state_plot(tree_pred, "California", "Pruned Decision Tree")
+
+# Examine the performance of the random forest model
+rf_rmse <- metrics(forest_pred, truth = unemployment_rate, estimate = .pred)$.estimate[2]
+rf_plot <- state_plot(forest_pred, "California", "Random Forest")
+
+# Examine the results of the boosted tree model
+bt_rmse <- metrics(boosted_pred, truth = unemployment_rate, estimate = .pred)$.estimate[2]
+bt_plot <- state_plot(boosted_pred, "California", "Boosted Tree")
+
+# Plot the California state unemployment rates for each model
+model_plots <- (en_plot | knn_plot | lm_plot) /
+  (dt_plot | rf_plot | bt_plot)
+plot(model_plots)
+```
+
+The graph displays the training set predicted unemployment rates for California for each model side-by-side in red, and the observed unemployment rate in black. Clearly, the random forest and boosted tree fit the closest, but were also the most difficult to avoid overfitting within the model. 
+
+```{r}
+# Combine results into a dataframe for graphing and compare results
+model_rmse <- data.frame(model = c("Elastic Net", "k-NN", "Linear Regression", "Pruned Decision Tree", "Random Forest", "Boosted Tree"), rmse = c(en_rmse, knn_rmse, lm_rmse, dt_rmse, rf_rmse, bt_rmse))
+ggplot(model_rmse, aes(x = reorder(model, rmse), y = rmse)) +
+  geom_bar(stat = "identity", fill = "skyblue") + 
+  labs(title = "RMSE of Models", x = "Model") +
+  theme_minimal()
+```
+
+This plot shows the RMSE of each model in ascending order, with boosted tree performing the best (but appearing to overfit the data in the first plot). Therefore, the boosted tree will be fit to the testing data, as will a model that appears to capture the general direction of unemployment without matching too closely - the elastic net model. The elastic net is an appealing choice since it appears to fit the overall trends in the training set without matching it too closely, suggesting that it is able to capture the movements in unemployment without overfitting. That being said, it does miss by quite a bit on the downtrend during 2005-2007, but it captures the increase during the Great Recession and subsequent decline well - it is possible that conditions during the lead-up to the subprime mortgage crisis led to mortgage data that was a poor predictor of unemployment rate because the data did not accurately reflect the status of the economy.
+
+# Testing Performance
+In order to test the performance of the model, the model must be used to predict unseen data using the testing set. As chosen in the previous step, the two models to be fit are the boosted tree and the k-NN models.
+
+```{r}
+# Use Elastic Net model to predict values for testing set and evaluate performance
+elastic_test <- predict(elastic_fit, new_data = split_test  %>%
+                               select(-unemployment_rate))
+# Bind true unemployment_rate as well as date, state for plotting purposes
+elastic_test <- bind_cols(elastic_test, split_test %>% select(unemployment_rate, state, date))
+
+# Elastic Net Model metrics
+metrics(elastic_test, truth = unemployment_rate, estimate = .pred)
+```
+The elastic net model has an R-squared of .287, and an RMSE of 1.873, performing notably worse on the testing set than the training set, although 
+
+
+```{r}
+# Use Boosted Tree model to predict values for testing set and evaluate performance
+boosted_test <- predict(boosted_fit, new_data = split_test %>%
+                          select(-unemployment_rate))
+boosted_test <- bind_cols(boosted_test, split_test %>%
+                            select(date, state, unemployment_rate))
+# Boosted Tree Model metrics
+metrics(boosted_test, truth = unemployment_rate, estimate = .pred)
+```
+The boosted tree model performed much worse on the testing set than on the training set, with an R-squared of .264 and RMSE of 2.063. This is worse than the elastic net model, suggesting that the boosted tree had overfitting.
+
+```{r testing_set}
+# Plot model performance on testing set
+enn_test_plot <- state_plot(elastic_test, "California", "Elastic Net Testing Set")
+boosted_test_plot <- state_plot(boosted_test, "California", "Boosted Tree Testing Set")
+
+plot(enn_test_plot | boosted_test_plot)
+```
+
+Visually, only the elastic net model seems to reflect the immediate downtrend from 2016-18, and both appear to predict a change in direction of unemployment rates as early as 2019 - however, this could be due to external changes in California's housing market rather than actually signaling a period of unemployment. Then, there is another increase in both models during the onset (or just before the onset) of the pandemic. The Boosted Tree model captures more of this spike, but neither model captures the true degree of unemployment perfectly. Then, both models predict the recovery and decline of the unemployment rate well. Interestingly, the metrics suggest the Elastic Net model outperforms the Boosted Tree model in R-squared, RMSE, and MAE even though the boosted tree vastly outperformed the elastic net on the training set. Thus, it seems that avoiding over-fitting in the elastic net model helped its performance on the testing set. 
+
+# Conclusion
+After fitting and analyzing various models, the best performing model by RMSE was determing to be the Boosted Tree model, and a less well-fit model was selected as the Elastic Net model, for how it appeared to fit the training set generally without such a tight fit to avoid overfitting. Upon evaluating the elastic net and boosted tree models on the testing set, it appears as if the elastic net model does a better job at detecting changes in direction of unemployment rates, as seen in the plot of predicted vs observed unemployment rates above, where the boosted tree model is not flexible enough to predict shifts. 
+
+The linear regression performed the worst on the training set, though in the end an elastic net model seemed to outperform the boosted tree on the testing set, and it is possible that a linear model would similarly outperform due to being a more generalizable model. The overfitting of the boosted tree and random forest models also suggests a reason to pursue extra steps to avoid this overfitting, though it may be difficult due to the complexity of the data.
+
+The presence of the Great Recession and the COVID-19 Pandemic in the dataset creates important factors to consider outside of these models. Regulatory changes to mortgages, security-writing, and investing may impact the broader market and thus unemployment rates, for which there may not be sufficient data at the moment, and for which old data may not be a good predictor. Furthermore, both of these economic downturns highlight the need to factor in news shocks into the model, since the model is unable to capture the extent of the sharp rise in unemployment rates. However, considering the limitations of the model, the mortgage data captures a fair amount of variation and the elastic net model performs well at matching direction changes of unemployment rates, even if it doesn't capture the full extent of the shift.
+
+Overall, this project was a valuable learning experience - creating the models and analyzing the results helped me learn to interpret and respond to data to develop a more accurate model, and I am happy with the results - the model seems to reflect the general trends of unemployment rates, and exceeded my expectations. I didn't expect mortgage data to reflect the impact of the COVID-19 pandemic in the predicted unemployment rate so quickly, but there appears to be little to no lag in the response, suggesting that mortgages respond to economic conditions quickly.
+
+# Sources
+The unemployment data was provided by the [Bureau of Labor Services](https://download.bls.gov/pub/time.series/la/), accessed on August 9th, 2024.
+
+Home values were taken from the [Zillow Home Value Index](https://www.zillow.com/research/data/), using all homes, by state, accessed on August 10th, 2024.
+
+New Residential Mortgage monthly data was taken from the [National Mortgage Database](https://www.fhfa.gov/data/national-mortgage-database-aggregate-statistics), provided by the Federal Housing Finance Agency, accessed on August 11th, 2024.
